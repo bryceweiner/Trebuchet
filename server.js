@@ -8,6 +8,7 @@ import dnsPromises from 'node:dns/promises';
 import {
   createTokenWithMetaplex,
   finishTokenCreation,
+  transferMetadataAuthority,
   generateTemporaryWallet,
   getWalletQRCode,
   checkWalletBalance,
@@ -25,7 +26,9 @@ import {
   getMintCompatibilityWithRaydiumClmm,
   KNOWN_QUOTES,
   KNOWN_SAFE_QUOTES,
+  getQuoteTokenOnChainPrice,
 } from './lpService.js';
+import { WSOL_MINT as WSOL_MINT_ADDRESS } from './lpConstants.js';
 
 import { swapSolForQuote, probeRaydiumPriceStrict } from './swapService.js';
 
@@ -64,12 +67,14 @@ import Decimal from 'decimal.js';
 import {
   normalizeTokenDescription,
   normalizeLogoImageMime,
+  assertLogoConstraints,
   normalizeTokenName,
   normalizeTokenSymbol,
   normalizeWholeTokenSupply,
 } from './validators.js';
 import { normalizeDistribution } from './lpDistribution.js';
 import { isWalletEffectivelyEmpty } from './walletRecovery.js';
+import { finishSweepWithSolGate } from './sweepOrchestrator.js';
 
 // In-flight airdrop guard. Maps wallet public key → boolean (currently
 // running). Used to reject concurrent /api/transfer-assets and
@@ -1442,7 +1447,12 @@ function uploadLogo(req, res, next) {
     }
     if (req.file) {
       try {
-        req.file.detectedMime = normalizeLogoImageMime(req.file.buffer);
+        // Authoritative logo validation: type + byte cap + 200×200 pixel
+        // ceiling (see validators.js for why the ceiling exists). The
+        // frontend pre-checks the same rule for a friendlier error, but
+        // the server never trusts the client.
+        const { mime } = assertLogoConstraints(req.file.buffer);
+        req.file.detectedMime = mime;
       } catch (logoError) {
         return res.status(400).json({ success: false, error: logoError.message });
       }
@@ -1469,6 +1479,9 @@ function recordTokenJournalProgress(walletPublicKey, event) {
   if (typeof event.metadataImmutable === 'boolean') {
     token.metadataImmutable = event.metadataImmutable;
   }
+  if (typeof event.metadataAuthorityKept === 'boolean') {
+    token.metadataAuthorityKept = event.metadataAuthorityKept;
+  }
 
   launchJournal.upsertForWallet(
     walletPublicKey,
@@ -1487,6 +1500,7 @@ function transferJournalSummary({
   nftSweep,
   tokenSweep,
   solSweepError,
+  solSweepSkipped,
   walletEmpty,
 }) {
   return {
@@ -1497,6 +1511,7 @@ function transferJournalSummary({
     tokenTransferErrors: tokenSweep?.errors || [],
     nftTransferErrors: nftSweep?.errors || [],
     solSweepError: solSweepError || null,
+    solSweepSkipped: solSweepSkipped || null,
     walletEmpty,
   };
 }
@@ -1829,6 +1844,7 @@ app.post('/api/finish-token-creation', async (req, res) => {
       totalSupply,
       metadataUri,
       journalEvents: journal.events || [],
+      keepMetadataAuthority: journal.token?.metadataAuthorityKept === true,
       onProgress: (event) => recordTokenJournalProgress(walletPublicKey, event),
     });
 
@@ -1940,6 +1956,10 @@ app.post('/api/create-token', uploadLogo, async (req, res) => {
           name: normalizedName,
           symbol: normalizedSymbol,
           totalSupply: normalizedTotalSupply,
+          // User's metadata-authority choice, recorded up front so the
+          // finish/resume path honors it even if creation crashes before
+          // reaching the revoke step. FormData fields arrive as strings.
+          metadataAuthorityKept: req.body.keepMetadataAuthority === 'true',
           decimals: 9,
         },
       },
@@ -1976,6 +1996,7 @@ app.post('/api/create-token', uploadLogo, async (req, res) => {
       vanityPrefix,
       vanitySuffix,
       vanityCAKeypair,
+      keepMetadataAuthority: req.body.keepMetadataAuthority === 'true',
       onProgress: (event) => recordTokenJournalProgress(walletPublicKey, event),
     });
     if (vanityCAPublicKey) {
@@ -2241,6 +2262,20 @@ const compatCache = new Map();
 const step2ProbeCache = new Map();
 const STEP2_PROBE_TTL_MS = 3 * 60 * 1000;  // 3 minutes
 
+// On-chain display-price cache. Same motivation as the probe cache above:
+// this endpoint fires on every input change, and the on-chain lookup is
+// three pool-discovery calls plus one RPC read per candidate pool — all
+// against the USER'S RPC. Uncached, that is a rate-limit trap on the free
+// public endpoint and a sluggish editor on any endpoint. Shorter TTL than
+// the probe cache because this IS the price the user is about to launch
+// against — a minute is long enough to absorb a keystroke storm and short
+// enough that the shown number tracks a live market. Keyed by mint AND
+// the RPC in use, so switching RPC never serves a price read elsewhere.
+// Spread findings are cached too (they are a property of the market, not
+// a transient failure); read errors are not, so the user can retry.
+const onChainPriceCache = new Map();
+const ON_CHAIN_PRICE_TTL_MS = 60 * 1000;
+
 // Quote-token info: when the user picks/enters a quote token in the UI,
 // we look up its symbol/decimals/USD price for inline display. For known
 // quote tokens (SOL/USDC/USDT) we use built-in constants. For arbitrary
@@ -2248,6 +2283,9 @@ const STEP2_PROBE_TTL_MS = 3 * 60 * 1000;  // 3 minutes
 // back to a truncated address as the symbol if the token isn't indexed
 // (in which case the user will need to fill in manual overrides).
 app.post('/api/quote-token-info', async (req, res) => {
+  // Demo: synthetic, instant, never blocks. Real mode below does on-chain
+  // reads, authority audits, Raydium probes, and pool-price discovery.
+  if (isDemoMode()) return demoChainService.handleQuoteTokenInfo(req, res);
   try {
     const { quoteToken } = req.body;
     if (!quoteToken) throw new Error('quoteToken required');
@@ -2330,6 +2368,38 @@ app.post('/api/quote-token-info', async (req, res) => {
           name: null,
           imageUrl: null,
         };
+      }
+
+      // On-chain pool price FIRST — the same source and rules the launch
+      // uses (deepest in-range pool with >= $100; spread refused), so the
+      // number the user sees in the editor is the number the launch will
+      // use. Overrides the aggregator baseline above when it qualifies.
+      // A spread finding is surfaced as a warning rather than hidden.
+      try {
+        const ocKey = `${getRpcUrl()}|${quoteToken}`;
+        const ocHit = onChainPriceCache.get(ocKey);
+        let oc;
+        if (ocHit && ocHit.expiresAt > Date.now()) {
+          oc = ocHit.result;
+        } else {
+          const solUsdForDisplay = await getUsdPrice(WSOL_MINT_ADDRESS);
+          oc = await getQuoteTokenOnChainPrice({ mint: quoteToken, solUsd: solUsdForDisplay });
+          // Cache a price or a spread finding; leave null (nothing usable /
+          // read failure) uncached so a transient RPC blip is retried.
+          if (oc) onChainPriceCache.set(ocKey, { result: oc, expiresAt: Date.now() + ON_CHAIN_PRICE_TTL_MS });
+        }
+        if (oc && oc.priceUsd) {
+          infoOut.priceUsd = oc.priceUsd.toString();
+          infoOut.priceSource = `on-chain:${oc.anchorSymbol}`;
+          infoOut.pricePoolId = oc.poolId;
+          infoOut.priceLiquidityUsd = Number(oc.liquidityUsd.toString());
+          infoOut.pricePoolsQualified = oc.qualifyingCount;
+          infoOut.pricePoolsDiscovered = oc.discoveredCount;
+        } else if (oc && oc.spreadError) {
+          infoOut.priceWarning = oc.spreadError;
+        }
+      } catch (ocErr) {
+        console.warn('quote-token-info: on-chain price lookup failed:', ocErr.message);
       }
 
       // Try the Raydium CLMM compatibility check + authority audit. If the
@@ -2954,6 +3024,8 @@ app.delete('/api/acquire-quote-tokens/:jobId', (req, res) => {
 // Error shape matches /api/create-lp's pre_flight branch so the
 // frontend can handle both with the same code path.
 app.post('/api/preflight-create-lp', async (req, res) => {
+  // Demo: synthetic resolved prices, no RPC, no on-chain mint reads.
+  if (isDemoMode()) return demoChainService.handlePreflightCreateLp(req, res);
   try {
     const {
       tokenTotalSupply,
@@ -3761,6 +3833,27 @@ app.post('/api/transfer-assets', async (req, res) => {
       { stage: 'transfer_started', destinationWallet },
     );
 
+    // 0. Metadata authority handoff (keep-authority launches only). The
+    //    update authority currently sits on the launch wallet, which this
+    //    transfer is about to empty and destroy. Hand it to the destination
+    //    FIRST; on failure abort the whole transfer — nothing has been
+    //    swept yet, so the user just retries, instead of losing the only
+    //    key that can ever change the token's name/logo.
+    if (typeof req.body.keepMetadataAuthorityMint === 'string'
+        && req.body.keepMetadataAuthorityMint) {
+      console.log('Transferring metadata update authority to destination...');
+      await transferMetadataAuthority({
+        tempWalletSecretKey: secretKeyArr,
+        tokenMint: req.body.keepMetadataAuthorityMint,
+        newAuthority: destinationWallet,
+      });
+      launchJournal.upsertForWallet(
+        walletPublicKey,
+        { stage: 'metadata_authority_transferred' },
+        { stage: 'metadata_authority_transferred', destinationWallet },
+      );
+    }
+
     // 1. NFTs first. Fee Keys especially — these are the most valuable
     //    sweep items and we want them locked in before risking SOL.
     const nftSweep = await sweepNftsToDestination({
@@ -3928,23 +4021,27 @@ app.post('/api/transfer-assets', async (req, res) => {
       destinationWallet,
     });
 
-    // 3. SOL last. If steps 1-2 left the wallet too low to cover this
-    //    tx fee, sweepSolToDestination returns 0 silently. Wrapped in
-    //    its own try/catch so a SOL-sweep RPC blip doesn't lose the
-    //    successful token/NFT results from steps 1-2 — those have
-    //    already landed on-chain and we want to report them even if
-    //    this final step needs the user to retry.
-    let solSweep = { solTransferred: 0 };
-    let solSweepError = null;
-    try {
-      solSweep = await sweepSolToDestination({
-        tempWalletSecretKey: secretKeyArr,
-        destinationWallet,
-      });
-    } catch (e) {
-      console.error('SOL sweep failed (token/NFT sweeps succeeded):', e.message);
-      solSweepError = e.message;
-    }
+    // 2.5 + 3. Straggler pass, SOL gate, and (gated) SOL sweep. The logic
+    //    lives in sweepOrchestrator.js as a pure dependency-injected unit —
+    //    see that module for the invariant and its rationale. Production
+    //    deps are the real walletHelpers functions; the journal recorder is
+    //    a closure over this wallet.
+    const {
+      solSweep, solSweepError, solSweepSkipped,
+    } = await finishSweepWithSolGate({
+      walletPublicKey,
+      tempWalletSecretKey: secretKeyArr,
+      destinationWallet,
+      nftSweep,
+      tokenSweep,
+      deps: {
+        sweepNfts: sweepNftsToDestination,
+        sweepTokens: sweepAllTokensToDestination,
+        sweepSol: sweepSolToDestination,
+        enumerate: (pk, opts) => checkWalletBalanceMultiToken(pk, opts),
+        recordEvent: (event) => launchJournal.recordEvent(walletPublicKey, event),
+      },
+    });
 
     // 4. Verify the wallet is on-chain empty before clearing the
     //    recovery cache entry. Anything still there → leave the cached
@@ -3952,7 +4049,9 @@ app.post('/api/transfer-assets', async (req, res) => {
     //    A balance-check failure also keeps the entry (conservative).
     let walletEmpty = false;
     try {
-      const remaining = await checkWalletBalanceMultiToken(walletPublicKey);
+      const remaining = await checkWalletBalanceMultiToken(
+        walletPublicKey, { commitment: 'finalized' },
+      );
       if (isWalletEffectivelyEmpty(remaining)) {
         pendingWallets.remove(walletPublicKey);
         walletEmpty = true;
@@ -3981,6 +4080,7 @@ app.post('/api/transfer-assets', async (req, res) => {
       : (launchJournal.activeForWallet(walletPublicKey)?.airdrop?.failed?.length || 0);
     const hasPartialFailure =
       !!solSweepError ||
+      !!solSweepSkipped ||
       (tokenSweep.errors || []).length > 0 ||
       (nftSweep.errors || []).length > 0 ||
       airdropFailedCount > 0 ||
@@ -3990,7 +4090,9 @@ app.post('/api/transfer-assets', async (req, res) => {
       {
         status: hasPartialFailure ? 'failed' : 'completed',
         stage: hasPartialFailure ? 'transfer_partial' : 'transfer_completed',
-        error: hasPartialFailure ? (solSweepError || 'wallet still has recoverable assets') : null,
+        error: hasPartialFailure
+          ? (solSweepError || solSweepSkipped || 'wallet still has recoverable assets')
+          : null,
         transfer: transferJournalSummary({
           destinationWallet,
           tokensTransferred,
@@ -3998,6 +4100,7 @@ app.post('/api/transfer-assets', async (req, res) => {
           nftSweep,
           tokenSweep,
           solSweepError,
+          solSweepSkipped,
           walletEmpty,
         }),
       },
@@ -4014,6 +4117,11 @@ app.post('/api/transfer-assets', async (req, res) => {
       success: true,
       tokensTransferred,
       solTransferred,
+      // When set, the SOL sweep was DELIBERATELY skipped because assets
+      // remain (or their absence couldn't be verified): the SOL stays in the
+      // launch wallet so a retry can pay its own fees. The frontend shows
+      // this string; it explicitly says nothing has been lost.
+      solSweepSkipped,
       destinationWallet,
       nftSweep,
       tokenSweep,

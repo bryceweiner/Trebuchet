@@ -1,6 +1,11 @@
 name: CI
 
 on:
+  # Direct pushes to main must run the suite too — as a solo-dev repo,
+  # most commits land on main without a PR, and pull_request alone means
+  # those ship untested.
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -60,30 +65,29 @@ jobs:
           TREBUCHET_SMOKE_TEST_RPC: ${{ secrets.SMOKE_TEST_RPC }}
         run: node --test test/smoke-launch.test.mjs
 
-      # F17: critical issues block the build outright.
-      - name: Critical audit gate
-        run: npm audit --audit-level=critical
-
-      # F17: high-severity issues are reported on every PR but do NOT block
-      # yet — the sole finding is an unfixed upstream vulnerability
-      # (GHSA-3gc7-fjrx-p6mg: bigint-buffer buffer overflow in toBigIntLE()).
-      # bigint-buffer 1.1.5 is current; @solana/buffer-layout-utils uses the
-      # vulnerable decode path for parsing on-chain data layouts.  In
-      # Trebuchet the attack surface is limited to reading trusted RPC data.
+      # Dependency audit gate. Replaces the previous pair of steps (a
+      # blocking `--audit-level=critical` plus a non-blocking
+      # `--audit-level=high`). That arrangement documented an invariant —
+      # "the sole high finding is bigint-buffer" — that nothing enforced, and
+      # it drifted to sixteen high-severity findings, including fixable ones
+      # in the Electron/electron-builder toolchain, unnoticed until an
+      # unrelated critical (node-tar) tripped the other gate.
       #
-      # No upstream fix is available as of 2026-06.  When a fix ships (in
-      # bigint-buffer or buffer-layout-utils), remove continue-on-error and
-      # make high-severity blocking like critical.
-      - name: High audit report (non-blocking — unfixed upstream vuln)
-        continue-on-error: true
-        run: npm audit --audit-level=high
+      # The gate script fails on ANY critical, and on any high that is not on
+      # its reviewed allowlist. Allowlisted residuals are printed with the
+      # reason they cannot be fixed. See scripts/audit-gate.mjs and the
+      # residuals section of SECURITY.md.
+      - name: Dependency audit gate
+        run: node scripts/audit-gate.mjs
 
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     env:
       ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
-      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+      # ELECTRON_BUILDER_CACHE is set by the "Locate electron-builder cache"
+      # step below, not here: it must live OUTSIDE the workspace (see that
+      # step), which needs the runner context — unavailable at job level.
     strategy:
       fail-fast: false
       matrix:
@@ -110,6 +114,16 @@ jobs:
         with:
           node-version: 22.12.0
           cache: npm
+
+      # electron-builder downloads CommonJS helper tools (the icons bundle's
+      # icon-tool.js) into its cache and runs them with node. A cache under
+      # the workspace inherits package.json's "type": "module" and the tools
+      # fail with "require is not defined in ES module scope" (release
+      # 1.0.49). Keep the cache outside the workspace. Done as a step rather
+      # than job-level env because `runner.temp` is only available here.
+      - name: Locate electron-builder cache
+        shell: bash
+        run: echo "ELECTRON_BUILDER_CACHE=$RUNNER_TEMP/electron-builder-cache" >> "$GITHUB_ENV"
 
       - name: Restore Electron caches
         uses: actions/cache@v5

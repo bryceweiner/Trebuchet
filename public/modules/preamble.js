@@ -373,6 +373,33 @@ const SPLIT_MAX_COUNT = 10;
 const LADDER_DEFAULT_PERCENT = 50;
 const LADDER_MIN_PERCENT = 20;
 const LADDER_MAX_PERCENT = 80;
+// Continuous-liquidity rules (mirror lpConstants on the server). The main
+// position is the full-range base the bands stack on. It is glue, not a
+// reserve: if the bands leave GAPS, the base must exist (server requires
+// >= 1 whole token; here "any supply at all"); if the bands touch, no base
+// is needed. A THIN base is a warning — base-only stretches are high-impact.
+const THIN_BASE_WARN_PERCENT = 0.5;
+const BAND_GAP_TOLERANCE = 0.01;
+// Minimal bootstrap covers launch ± half its width; coverage starts here.
+const MINIMAL_BOOTSTRAP_UPPER_MULT = 1 + 30 / 200;
+
+// Sort manual bands by lower multiplier and report any stretch above the
+// bootstrap's upper edge that no band covers. Same logic as findBandGaps
+// on the server so the editor and the launch never disagree.
+function findManualBandGaps(bands, bootstrapMode) {
+  if (bootstrapMode === 'custom') return [];
+  const sorted = (bands || [])
+    .map((b) => ({ lower: Number(b.lowerMultiplier), upper: Number(b.upperMultiplier) }))
+    .filter((b) => Number.isFinite(b.lower) && Number.isFinite(b.upper) && b.upper > b.lower)
+    .sort((x, y) => x.lower - y.lower);
+  let cursor = MINIMAL_BOOTSTRAP_UPPER_MULT;
+  const gaps = [];
+  for (const b of sorted) {
+    if (b.lower > cursor * (1 + BAND_GAP_TOLERANCE)) gaps.push({ from: cursor, to: b.lower });
+    cursor = Math.max(cursor, b.upper);
+  }
+  return gaps;
+}
 const LADDER_DEFAULT_BANDS = 5;
 const LADDER_MIN_BANDS = 3;
 const LADDER_MAX_BANDS = 10;
@@ -476,7 +503,14 @@ const MAX_TOKEN_SUPPLY = 10_000_000_000;
 // small enough to allow simple pixel-art logos while catching the
 // common "I picked the wrong file" case.
 const MAX_LOGO_BYTES = 100 * 1024;
-const MAX_LOGO_DIMENSION = 1024;
+// 200×200 ceiling (was 1024): the logo embeds base64 into the metadata
+// JSON and the launch-report HTML, both under hard upload budgets — at
+// 1024px a logo could single-handedly blow the report past the ~95KB
+// sponsored-upload cap, which is how "my logo doesn't show in the report"
+// happened. The server enforces the same rule authoritatively
+// (validators.js assertLogoConstraints); this check just fails friendlier
+// and earlier. Keep the two in sync.
+const MAX_LOGO_DIMENSION = 200;
 const MIN_LOGO_DIMENSION = 64;
 
 // State for the simple-config UI. `mode` is the master switch:

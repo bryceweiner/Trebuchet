@@ -50,6 +50,10 @@ bind('createTokenBtn', 'click', async () => {
       }
       const logoFile = document.getElementById('tokenLogo').files[0];
       if (logoFile) formData.append('logo', logoFile);
+      // Metadata-authority choice. Checkbox CHECKED means revoke (the
+      // long-standing default); the server flag is the inverse: keep.
+      const revokeMeta = document.getElementById('revokeMetadataToggle');
+      formData.append('keepMetadataAuthority', String(!!(revokeMeta && !revokeMeta.checked)));
 
       const resp = await fetch('/api/create-token', { method: 'POST', body: formData });
       const data = await resp.json();
@@ -79,6 +83,9 @@ bind('createTokenBtn', 'click', async () => {
         freezeAuthorityDisabled: data.freezeAuthorityDisabled === true,
         metadataUpdateAuthorityRevoked: data.metadataUpdateAuthorityRevoked === true,
         metadataImmutable: data.metadataImmutable === true,
+        // True when the user opted to keep the update authority; step 6
+        // reads this to trigger the authority handoff before the sweep.
+        metadataAuthorityKept: data.metadataAuthorityKept === true,
       };
 
       document.getElementById('tokenMintAddress').textContent = data.tokenMint;
@@ -185,10 +192,17 @@ function renderLpSummary() {
 // Modal is shown and torn down here; on Confirm we resolve with the
 // passed-in prices unchanged (the modal doesn't modify them), on
 // Cancel we resolve null.
+// Sentinel returned by showPreflightModal when the user asks for fresh
+// prices instead of confirming or cancelling. runPreflightAndConfirm
+// handles it by re-basing each allocation's drift reference to the prices
+// just shown and running preflight again.
+const PREFLIGHT_REFRESH = Object.freeze({ refresh: true });
+
 function showPreflightModal(resolvedPrices) {
   const modal = document.getElementById('createLpConfirmModal');
   const proceedBtn = document.getElementById('createLpConfirmProceedBtn');
   const cancelBtn = document.getElementById('createLpConfirmCancelBtn');
+  const refreshBtn = document.getElementById('createLpConfirmRefreshBtn'); // optional: older markup lacks it
   if (!modal || !proceedBtn || !cancelBtn) {
     // Modal markup missing. The plan's safety-first principle is: when
     // in doubt, REFUSE to launch — silently bypassing the confirmation
@@ -217,14 +231,17 @@ function showPreflightModal(resolvedPrices) {
       modal.classList.remove('is-active');
       proceedBtn.removeEventListener('click', onProceed);
       cancelBtn.removeEventListener('click', onCancel);
+      if (refreshBtn) refreshBtn.removeEventListener('click', onRefresh);
       const bg = modal.querySelector('.modal-background');
       if (bg) bg.removeEventListener('click', onCancel);
       resolve(val);
     };
     const onProceed = () => finish(resolvedPrices);
     const onCancel = () => finish(null);
+    const onRefresh = () => finish(PREFLIGHT_REFRESH);
     proceedBtn.addEventListener('click', onProceed);
     cancelBtn.addEventListener('click', onCancel);
+    if (refreshBtn) refreshBtn.addEventListener('click', onRefresh);
     const bg = modal.querySelector('.modal-background');
     if (bg) bg.addEventListener('click', onCancel);
     modal.classList.add('is-active');
@@ -286,7 +303,22 @@ function renderPreflightModalBody(resolvedPrices) {
     // sourceHtml is interpolated raw (not via escapeHtml) so the link can
     // render — non-link branches escape their own content where needed.
     let sourceHtml;
-    if (rp.source === 'raydium-probe') {
+    if (typeof rp.source === 'string' && rp.source.startsWith('on-chain:')) {
+      // The primary source now: read from the pool account itself, not an
+      // indexer. Name the anchor pair so the user knows what the price is
+      // measured against. "(shared)" is appended by the creation loop when
+      // a second pool reuses the first's resolution — preserve it.
+      const rest = rp.source.slice('on-chain:'.length);
+      const anchor = rest.replace(/\s*\(shared\)\s*$/, '');
+      const shared = /\(shared\)/.test(rest) ? ' (shared)' : '';
+      sourceHtml =
+        '<span title="Price read directly from the on-chain pool account — the exact source the launch uses.">' +
+        'on-chain ' + escapeHtml(anchor) + ' pool' + shared + '</span>';
+    } else if (rp.source === 'user') {
+      sourceHtml =
+        '<span class="has-text-warning-dark" title="No market source could price this token; ' +
+        'Trebuchet is using the value you entered.">price you entered — no market source</span>';
+    } else if (rp.source === 'raydium-probe') {
       sourceHtml = 'verified from Raydium';
     } else if (rp.source === 'sol') {
       sourceHtml = 'SOL/USD oracle';
@@ -328,6 +360,15 @@ function renderPreflightModalBody(resolvedPrices) {
           `<i class="fas fa-exclamation-circle"></i> ` +
           `${symbol} price is ${Math.abs(rp.driftPct).toFixed(1)}% ${direction} than ` +
           `the funding estimate — within tolerance, but worth a glance.` +
+        `</div>`;
+    }
+    // Second opinion on a user-entered price: the market disagrees with
+    // what they typed. Not a refusal (they chose it) — but say so, here,
+    // where they are about to commit real money.
+    if (rp.secondOpinionWarning) {
+      driftLine +=
+        `<div class="is-size-7 has-text-danger mt-1">` +
+          `<i class="fas fa-exclamation-triangle"></i> ${escapeHtml(rp.secondOpinionWarning)}` +
         `</div>`;
     }
 
@@ -438,7 +479,24 @@ async function runPreflightAndConfirm(allocations, targetMc) {
     throw err;
   }
 
-  return await showPreflightModal(data.preflight.resolvedPrices);
+  const choice = await showPreflightModal(data.preflight.resolvedPrices);
+  if (choice === PREFLIGHT_REFRESH) {
+    // "Refresh prices": re-base each allocation's drift reference to the
+    // price the user was just looking at, then run preflight again. The
+    // drift indicator therefore measures movement SINCE THE LAST LOOK —
+    // if it's still large after a refresh or two, the market itself is
+    // unstable (thin liquidity), and the modal copy says so. This is the
+    // same re-basing Confirm performs, done early and in place, instead of
+    // sending the user back to Step 3 to click a different button.
+    for (const rp of data.preflight.resolvedPrices) {
+      if (!Number.isInteger(rp.allocationIndex)) continue;
+      if (rp.allocationIndex < 0 || rp.allocationIndex >= allocations.length) continue;
+      allocations[rp.allocationIndex].quoteUsdOverride = Number(rp.quoteUsd);
+    }
+    log('Refreshing prices…', 'info');
+    return await runPreflightAndConfirm(allocations, targetMc);
+  }
+  return choice;
 }
 
 bind('createLpBtn', 'click', async () => {

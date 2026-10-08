@@ -50,16 +50,21 @@ const DEFAULTS = Object.freeze({
   checkForUpdatesOnStartup: true,
   // Medieval gauntlet cursor theme. Off by default — covers every
   // cursor state (idle, pointer, active, text, wait, resize, etc.)
-  // with hand-and-quill artwork. Can be turned off in settings for
-  // users who rely on OS cursor-size / high-contrast accessibility
-  // overrides, since custom cursors bypass those.
-  medievalCursor: false,
-  // Migration guard for the cursor theme. Older builds persisted the full
-  // default-shaped prefs object whenever any setting changed, so many users
-  // have medievalCursor:true on disk even though they never opted in. The
-  // renderer only enables the theme when both fields are true; the settings
-  // checkbox writes both fields together from now on.
-  medievalCursorOptIn: false,
+  // with hand-and-quill artwork. ON by default (product decision,
+  // September 2026) — it is part of the app's look. Can be turned off in
+  // settings for users who rely on OS cursor-size / high-contrast
+  // accessibility overrides, since custom cursors bypass those.
+  medievalCursor: true,
+  // Paired opt-in flag. Historically a migration guard: older builds
+  // persisted the full default-shaped prefs object on any change, leaving
+  // medievalCursor:true on disk for users who never chose it, so the
+  // renderer requires BOTH fields true and the settings checkbox writes
+  // both together. With the theme now on by default the pair defaults to
+  // true as well. Note the guard's other property still holds: a user who
+  // has EXPLICITLY turned the cursor off has both fields persisted false
+  // on disk, and persisted values always win over defaults — so this
+  // change affects fresh installs and never overrides a saved choice.
+  medievalCursorOptIn: true,
   // 3D spinning coin in the token preview card. On by default; can be
   // turned off (falls back to the flat logo) for weak hardware or
   // personal preference.
@@ -70,6 +75,11 @@ const DEFAULTS = Object.freeze({
   // changes, capturing tutorial screenshots, and demonstrating the app
   // without chain risk. Off by default; intentional opt-in only.
   demoMode: false,
+  // First-launch welcome card (demo-mode champion + RPC-setup explainer at
+  // the top of the page). Shown until the user dismisses it via "Don't show
+  // this again"; the renderer's setupWelcomeCard() reads this on load and
+  // the dismiss link writes false.
+  showWelcomeCard: true,
   // Intro splash video. The short animation that plays on startup. On by
   // default; can be turned off in settings so the app opens straight to the
   // UI (handy once the novelty wears off, or on slow hardware). Read by the

@@ -52,8 +52,64 @@ export const AUTOSWAP_SIZING_MULTIPLIER = 2;
 export const AUTOSWAP_CUSTOM_TARGET_MULTIPLIER = 1.15;
 export const AUTOSWAP_CUSTOM_SIZING_MULTIPLIER = 1.10;
 
+// Continuous-liquidity rules for the wide "main" position (launch price to
+// the top of the tick range — the pool's base layer that bands stack on).
+//
+// The base is GLUE, not a reserve. Its only job is to connect the discrete
+// band positions so price can move between them; in a CLMM a zero-liquidity
+// stretch has nothing to swap against and price teleports across it.
+//
+//   - If the bands leave GAPS between positions, the base must exist with
+//     at least one whole token. That is a hard requirement (refused before
+//     any SOL is spent). One token is enough to make the range continuous.
+//   - If the bands are contiguous, no base is required at all.
+//   - Either way, a THIN base makes the base-only stretches high-impact
+//     (a small trade moves price a long way). That is a warning, not a
+//     block — the user may want exactly that scarcity.
+//
+// Whole tokens required in the base when gaps exist:
+export const MIN_BASE_TOKENS_WHEN_GAPPED = 1;
+// Below this share of the pool's supply the base is "thin" and we warn:
+export const THIN_BASE_WARN_BPS = 50; // 0.5%
+// Multiplier tolerance when deciding whether two bands touch (tick
+// alignment can leave slivers that are not real gaps):
+export const BAND_GAP_TOLERANCE = 0.01;
+
 // Fallback SOL-USD price when oracle is unavailable.
 export const FALLBACK_SOL_USD = 200;
+
+// Minimum USD liquidity that must back an aggregator-sourced quote-token
+// price before it may be used to set a pool's STARTING price.
+//
+// Rationale: the starting price fixes the launch market cap, and it is
+// computed as launchedTokenUsd / quoteUsd. For an unverified low-cap quote
+// token the aggregators will happily report a price derived from a pool
+// holding a few dollars — a number that reflects the last tiny trade, not
+// a market. Using it puts that pool at a different market cap than its
+// siblings; arbitrage then drains the cheap side the moment trading opens
+// and the chart shows an immediate crash.
+//
+// $10k is deliberately modest: it admits genuinely small but real markets
+// while excluding dust pools. Users who know better can still proceed by
+// setting an explicit price override.
+export const MIN_QUOTE_LIQUIDITY_USD = 10_000;
+
+// Maximum price impact (percent) the Raydium price probe may report before
+// its price is refused as a launch reference. Same problem as the
+// aggregator liquidity floor above, on the OTHER (and first-tried) path:
+// the probe swaps a small fixed SOL notional; a real market absorbs it
+// with a fraction of a percent of impact, a dust pool shows tens of
+// percent. 5% is generous for the probe size and still catches the
+// dust-pool case decisively.
+export const MAX_PROBE_PRICE_IMPACT_PCT = 5;
+
+// Preflight second opinion: the primary price source (on-chain pool read
+// or Raydium probe) is compared against the aggregators' independent view
+// of the same token, when that view is backed by real depth. Beyond this
+// spread one of the two is wrong and the launch is refused. Generous
+// because low-cap markets legitimately differ across venues; a 3x error
+// (the incident this defends against) is far outside it.
+export const MAX_SECOND_OPINION_SPREAD_PCT = 25;
 
 // Well-known mint addresses.
 export const WSOL_MINT = 'So11111111111111111111111111111111111111112';
