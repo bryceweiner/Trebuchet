@@ -7,6 +7,7 @@ import {
   appleApiKeyContents,
   builderEnvironment,
   buildReleaseNotes,
+  cscLinkSource,
   electronBuilderInvocation,
   macSignatureChecks,
   resolveReleaseBuild,
@@ -247,6 +248,27 @@ test('notarization key secrets are handed to notarytool as a file', () => {
   assert.equal(appleApiKeyContents({ APPLE_API_KEY: pem }), pem);
   assert.equal(appleApiKeyContents({ APPLE_API_KEY: '/keys/AuthKey_ABC123.p8' }), null);
   assert.equal(appleApiKeyContents({}), null);
+});
+
+test('CSC_LINK is read as a path or as the base64 .p12 a GitHub secret holds', () => {
+  const p12 = Buffer.from([0x30, 0x82, 0x0b, 0x2e, 0x02, 0x01, 0x03]);
+
+  assert.deepEqual(cscLinkSource(`${p12.toString('base64')}\n`), { kind: 'base64', bytes: p12 });
+  assert.deepEqual(cscLinkSource('/keys/DeveloperID.p12'), { kind: 'path', path: '/keys/DeveloperID.p12' });
+  assert.deepEqual(cscLinkSource('file:///keys/DeveloperID.p12'), { kind: 'path', path: '/keys/DeveloperID.p12' });
+  assert.deepEqual(cscLinkSource('~/keys/id.p12', '/Users/me'), { kind: 'path', path: '/Users/me/keys/id.p12' });
+  assert.throws(() => cscLinkSource('https://example.com/id.p12'), /not a URL/);
+});
+
+test('signed macOS builds sign from a keychain the release script prepares', () => {
+  // electron-builder's own CSC_LINK import passes the .p12 password as the
+  // keychain password, which macOS 26 rejects before anything is signed.
+  const build = read('scripts/release-build.mjs');
+
+  assert.match(build, /env\.CSC_KEYCHAIN = keychain/);
+  assert.match(build, /delete env\.CSC_LINK/);
+  assert.match(build, /'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, keychain/);
+  assert.equal(existsSync(new URL('../build/apple-developer-id-g2.cer', import.meta.url)), true);
 });
 
 test('signed macOS builds must satisfy Gatekeeper before they are published', () => {

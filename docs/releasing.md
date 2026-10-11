@@ -42,7 +42,7 @@ Each platform's build receives only its own signing variables. electron-builder 
 ### Setting up macOS signing
 
 1. Join the [Apple Developer Program](https://developer.apple.com/programs/enroll/). The account holder's name is the publisher users see.
-2. Create a **Developer ID Application** certificate. In Keychain Access, choose Certificate Assistant → Request a Certificate From a Certificate Authority and save the request to disk. Upload it under [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/certificates/add), then open the downloaded certificate to add it to your keychain.
+2. Create a **Developer ID Application** certificate; only the Account Holder can. In Keychain Access, choose Certificate Assistant → Request a Certificate From a Certificate Authority and save the request to disk. Then in [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/certificates/list), open **Certificates**, not Identifiers (an App ID is only needed for the Mac App Store). Click **+**, choose **Developer ID** under Software, then **Developer ID Application**, and upload the request. Open the downloaded certificate to add it to your keychain.
 3. In Keychain Access → My Certificates, export "Developer ID Application: …" as a `.p12` protected by a strong password.
 4. For notarization, create an App Store Connect API key under Users and Access → Integrations → Team Keys, with **Developer** access. Download the `.p8` (Apple allows one download), and note its Key ID and the Issuer ID.
 5. Add these repository secrets under Settings → Secrets and variables → Actions:
@@ -51,7 +51,7 @@ Each platform's build receives only its own signing variables. electron-builder 
    - `APPLE_API_KEY`: the full text of the `.p8` (`pbcopy < AuthKey_XXXXXXXXXX.p8`); the build writes it to a file for `notarytool`
    - `APPLE_API_KEY_ID` and `APPLE_API_ISSUER`
 
-The next release then signs and notarizes both macOS DMGs. The build refuses to label them signed and notarized unless `codesign`, `stapler`, and Gatekeeper (`spctl`) all accept the app.
+The next release then signs and notarizes both macOS DMGs. The release script imports the certificate into a temporary keychain of its own, adding Apple's Developer ID intermediate ([`build/apple-developer-id-g2.cer`](../build/apple-developer-id-g2.cer)) when the `.p12` lacks it. It hands that keychain to electron-builder and deletes it afterwards. (electron-builder's own import passes the `.p12` password as the keychain password, which macOS 26 rejects.) The build refuses to label the DMGs signed and notarized unless `codesign`, `stapler`, and Gatekeeper (`spctl`) all accept the app.
 
 ## Verification
 

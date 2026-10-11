@@ -1,16 +1,92 @@
 import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   appleApiKeyContents,
   builderEnvironment,
   collectFiles,
+  cscLinkSource,
   electronBuilderInvocation,
   macSignatureChecks,
   resolveReleaseBuild,
 } from './release-lib.mjs';
+
+// Apple's Developer ID intermediate (G2). codesign can't build the chain to
+// Apple's root without it, and a .p12 exported from Keychain Access lacks it.
+const DEVELOPER_ID_INTERMEDIATE = fileURLToPath(new URL('../build/apple-developer-id-g2.cer', import.meta.url));
+
+function security(args) {
+  const result = spawnSync('/usr/bin/security', args, { encoding: 'utf8' });
+  if (result.status !== 0) {
+    // The arguments carry passwords, so only the subcommand is named.
+    throw new Error(`security ${args[0]} failed: ${(result.stderr || result.stdout || '').trim()}`);
+  }
+  return result.stdout;
+}
+
+// Puts what a signed macOS build needs on disk, and returns a function that
+// undoes it all.
+//  - notarytool reads the App Store Connect key from a file, but a GitHub
+//    secret can only hold its text (see appleApiKeyContents).
+//  - electron-builder imports CSC_LINK into a temporary keychain itself, then
+//    passes the .p12 password where `security set-key-partition-list` wants
+//    the keychain's own password. macOS 26 rejects that (older releases let
+//    it through) and the build dies before anything is signed. So the
+//    keychain is built here, correctly, and handed over as CSC_KEYCHAIN.
+async function prepareMacSigning(env) {
+  const workDir = await mkdtemp(path.join(os.tmpdir(), 'trebuchet-signing-'));
+  const keychain = path.join(workDir, 'signing.keychain-db');
+  const searchList = security(['list-keychains', '-d', 'user'])
+    .split('\n')
+    .map((line) => line.trim().replace(/^"|"$/g, ''))
+    .filter(Boolean);
+  const cleanUp = async () => {
+    spawnSync('/usr/bin/security', ['list-keychains', '-d', 'user', '-s', ...searchList]);
+    spawnSync('/usr/bin/security', ['delete-keychain', keychain]);
+    await rm(workDir, { force: true, recursive: true });
+  };
+
+  try {
+    const apiKey = appleApiKeyContents(env);
+    if (apiKey) {
+      env.APPLE_API_KEY = path.join(workDir, 'AuthKey.p8');
+      await writeFile(env.APPLE_API_KEY, apiKey.endsWith('\n') ? apiKey : `${apiKey}\n`, { mode: 0o600 });
+    }
+
+    const certificate = cscLinkSource(env.CSC_LINK);
+    let p12 = certificate.path;
+    if (certificate.kind === 'base64') {
+      p12 = path.join(workDir, 'certificate.p12');
+      await writeFile(p12, certificate.bytes, { mode: 0o600 });
+    }
+
+    const password = randomBytes(24).toString('hex');
+    security(['create-keychain', '-p', password, keychain]);
+    security(['set-keychain-settings', keychain]);
+    security(['unlock-keychain', '-p', password, keychain]);
+    security(['import', p12, '-k', keychain, '-P', env.CSC_KEY_PASSWORD, '-T', '/usr/bin/codesign', '-T', '/usr/bin/productbuild']);
+    security(['set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, keychain]);
+    const hasIntermediate =
+      spawnSync('/usr/bin/security', ['find-certificate', '-c', 'Developer ID Certification Authority', keychain]).status === 0;
+    if (!hasIntermediate) {
+      security(['import', DEVELOPER_ID_INTERMEDIATE, '-k', keychain]);
+    }
+    // codesign only builds certificate chains from keychains on the search list.
+    security(['list-keychains', '-d', 'user', '-s', keychain, ...searchList]);
+  } catch (error) {
+    await cleanUp();
+    throw error;
+  }
+
+  delete env.CSC_LINK;
+  delete env.CSC_KEY_PASSWORD;
+  env.CSC_KEYCHAIN = keychain;
+  return cleanUp;
+}
 
 const target = process.env.TREBUCHET_RELEASE_TARGET;
 
@@ -56,17 +132,7 @@ await rm(distDir, { force: true, recursive: true });
 }
 
 const env = builderEnvironment(plan.target, process.env);
-
-// notarytool reads the App Store Connect key from a file; see
-// appleApiKeyContents. Removed again as soon as electron-builder exits.
-const apiKeyContents = plan.target.startsWith('macos-') ? appleApiKeyContents(env) : null;
-const apiKeyDir = apiKeyContents ? await mkdtemp(path.join(os.tmpdir(), 'trebuchet-notary-')) : null;
-if (apiKeyDir) {
-  env.APPLE_API_KEY = path.join(apiKeyDir, 'AuthKey.p8');
-  await writeFile(env.APPLE_API_KEY, apiKeyContents.endsWith('\n') ? apiKeyContents : `${apiKeyContents}\n`, {
-    mode: 0o600,
-  });
-}
+const cleanUpSigning = plan.trust === 'signed and notarized' ? await prepareMacSigning(env) : null;
 
 const invocation = electronBuilderInvocation(plan.builderArgs);
 const result = spawnSync(invocation.command, invocation.args, {
@@ -76,8 +142,8 @@ const result = spawnSync(invocation.command, invocation.args, {
   stdio: 'inherit',
 });
 
-if (apiKeyDir) {
-  await rm(apiKeyDir, { force: true, recursive: true });
+if (cleanUpSigning) {
+  await cleanUpSigning();
 }
 
 if (result.error) {

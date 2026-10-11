@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const TARGETS = {
   'macos-arm64': {
@@ -171,6 +173,26 @@ export function builderEnvironment(target, env = process.env) {
 export function appleApiKeyContents(env) {
   const value = env.APPLE_API_KEY;
   return typeof value === 'string' && value.includes('-----BEGIN PRIVATE KEY-----') ? value : null;
+}
+
+// CSC_LINK in the forms electron-builder documents: a path, a file:// URL,
+// or the .p12 itself base64-encoded (what a GitHub secret holds). A DER .p12
+// starts with 0x30, so its base64 starts with "M" and can't pass for a path.
+export function cscLinkSource(value, home = os.homedir()) {
+  const link = value.trim();
+  if (/^https?:\/\//.test(link)) {
+    throw new Error('CSC_LINK must be a file path or the base64-encoded .p12, not a URL.');
+  }
+  if (link.startsWith('file://')) {
+    return { kind: 'path', path: fileURLToPath(link) };
+  }
+  if (link.startsWith('~/')) {
+    return { kind: 'path', path: path.join(home, link.slice(2)) };
+  }
+  if (/^\.{0,2}\//.test(link) || /\.(p12|pfx)$/i.test(link)) {
+    return { kind: 'path', path: link };
+  }
+  return { kind: 'base64', bytes: Buffer.from(link.replace(/\s+/g, ''), 'base64') };
 }
 
 // What a macOS build must pass before it is published as "signed and
