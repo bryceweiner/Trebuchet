@@ -31,7 +31,7 @@ The workflow builds:
   - `APPLE_KEYCHAIN`, `APPLE_KEYCHAIN_PROFILE`.
 - If the macOS credentials are absent, the workflow still builds macOS **unsigned test artifacts** and marks the release accordingly. Website download cards disclose that macOS may report unsigned downloads as damaged, and show the quarantine-removal command for users who trust the download:
   `xattr -dr com.apple.quarantine /Applications/Trebuchet.app`.
-- Windows installer and portable EXE artifacts are **signed** only when `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD` are configured.
+- Windows installer and portable EXE artifacts are **signed** when Azure Artifact Signing is configured (see [Setting up Windows signing](#setting-up-windows-signing)), or when a `.pfx` is provided as `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD`. Code-signing certificates issued since 2023 can't be exported as a `.pfx`, so Azure is the practical route.
 - If the Windows credentials are absent, the workflow still builds Windows installer and portable EXE **unsigned test artifacts** and marks the release accordingly.
 - Linux AppImage and deb artifacts are built as **unsigned** packages.
 
@@ -52,6 +52,20 @@ Each platform's build receives only its own signing variables. electron-builder 
    - `APPLE_API_KEY_ID` and `APPLE_API_ISSUER`
 
 The next release then signs and notarizes both macOS DMGs. The release script imports the certificate into a temporary keychain of its own, adding Apple's Developer ID intermediate ([`build/apple-developer-id-g2.cer`](../build/apple-developer-id-g2.cer)) when the `.p12` lacks it. It hands that keychain to electron-builder and deletes it afterwards. (electron-builder's own import passes the `.p12` password as the keychain password, which macOS 26 rejects.) The build refuses to label the DMGs signed and notarized unless `codesign`, `stapler`, and Gatekeeper (`spctl`) all accept the app.
+
+### Setting up Windows signing
+
+Windows builds sign through [Azure Artifact Signing](https://learn.microsoft.com/azure/artifact-signing/) (formerly Trusted Signing). Individual developers must be located in the US or Canada.
+
+1. Create an Azure subscription whose billing account has Account Type **Individual**. Its legal name and sold-to address must match your government ID. The name, city, state, and country appear on the certificate.
+2. Under Subscriptions → your subscription → Resource providers, register `Microsoft.CodeSigning`.
+3. Create an **Artifact Signing account** (Basic tier) in a supported region. Note its name and its region's endpoint, for example `https://eus.codesigning.azure.net` for East US.
+4. On that account, give yourself the **Artifact Signing Identity Verifier** role under Access control (IAM). Then open Identity validations → Individual → New Identity → Public, and finish the ID check it links to. Validation takes 1–20 business days.
+5. When the validation shows **Completed**, create a **Public Trust** certificate profile for it.
+6. For CI, create an app registration in Microsoft Entra ID and give it a client secret. Then grant it the **Artifact Signing Certificate Profile Signer** role on the signing account. Client secrets expire (after at most two years), so renew `AZURE_CLIENT_SECRET` before then.
+7. Add repository secrets `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`. Add repository variables `ARTIFACT_SIGNING_ENDPOINT`, `ARTIFACT_SIGNING_ACCOUNT`, `ARTIFACT_SIGNING_PROFILE`, and `ARTIFACT_SIGNING_PUBLISHER`; the publisher is the certificate's common name, which is your validated legal name.
+
+The Windows build then signs the installer and portable EXE through electron-builder's `win.azureSignOptions`. It refuses to label them signed unless Windows reports each signature as `Valid`. With macOS and Windows both signed, releases are no longer marked as prereleases.
 
 ## Verification
 

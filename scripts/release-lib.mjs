@@ -52,6 +52,20 @@ const MAC_KEYS = [
 
 const WINDOWS_KEYS = ['WIN_CSC_LINK', 'WIN_CSC_KEY_PASSWORD'];
 
+// Azure Artifact Signing (formerly Trusted Signing). The AZURE_* trio is the
+// service principal Microsoft's signing module logs in with; the
+// ARTIFACT_SIGNING_* settings pick the account and certificate profile, and
+// the publisher name must match the certificate's common name.
+const AZURE_SIGNING_KEYS = [
+  'AZURE_TENANT_ID',
+  'AZURE_CLIENT_ID',
+  'AZURE_CLIENT_SECRET',
+  'ARTIFACT_SIGNING_ENDPOINT',
+  'ARTIFACT_SIGNING_ACCOUNT',
+  'ARTIFACT_SIGNING_PROFILE',
+  'ARTIFACT_SIGNING_PUBLISHER',
+];
+
 function hasValue(value) {
   return typeof value === 'string' ? value.trim() !== '' : Boolean(value);
 }
@@ -120,17 +134,28 @@ export function resolveReleaseBuild(target, env = process.env) {
   }
 
   if (target === 'windows') {
-    const windowsConfigured = hasAny(env, WINDOWS_KEYS);
-    const windowsReady = hasAll(env, WINDOWS_KEYS);
+    const pfxConfigured = hasAny(env, WINDOWS_KEYS);
+    const azureConfigured = hasAny(env, AZURE_SIGNING_KEYS);
 
-    if (windowsConfigured && !windowsReady) {
+    if ((pfxConfigured && !hasAll(env, WINDOWS_KEYS)) || (azureConfigured && !hasAll(env, AZURE_SIGNING_KEYS))) {
       throw new Error(
-        'Incomplete Windows signing configuration. Provide WIN_CSC_LINK + ' +
-          'WIN_CSC_KEY_PASSWORD, or provide neither to publish unsigned test artifacts.',
+        'Incomplete Windows signing configuration. Provide WIN_CSC_LINK + WIN_CSC_KEY_PASSWORD, ' +
+          `or all of ${AZURE_SIGNING_KEYS.join(', ')} for Azure Artifact Signing, ` +
+          'or none of them to publish unsigned test artifacts.',
       );
     }
 
-    if (windowsReady) {
+    // electron-builder signs with Azure whenever azureSignOptions is set.
+    if (azureConfigured) {
+      plan.trust = 'signed';
+      plan.builderArgs.push(
+        '-c.forceCodeSigning=true',
+        `-c.win.azureSignOptions.endpoint=${env.ARTIFACT_SIGNING_ENDPOINT.trim()}`,
+        `-c.win.azureSignOptions.codeSigningAccountName=${env.ARTIFACT_SIGNING_ACCOUNT.trim()}`,
+        `-c.win.azureSignOptions.certificateProfileName=${env.ARTIFACT_SIGNING_PROFILE.trim()}`,
+        `-c.win.azureSignOptions.publisherName=${env.ARTIFACT_SIGNING_PUBLISHER.trim()}`,
+      );
+    } else if (pfxConfigured) {
       plan.trust = 'signed';
       plan.builderArgs.push('-c.forceCodeSigning=true');
     } else {
@@ -144,10 +169,22 @@ export function resolveReleaseBuild(target, env = process.env) {
   return plan;
 }
 
+// With shell: true, Node hands cmd.exe a single command line that cmd.exe
+// splits on spaces, so an argument such as the Azure publisher name ("First
+// Last") has to arrive quoted. cmd.exe expands %VAR% even inside quotes and
+// an embedded quote can't be escaped reliably, so those are refused.
+function quoteForCmd(arg) {
+  if (/["%]/.test(arg)) {
+    throw new Error(`Can't pass ${JSON.stringify(arg)} through the Windows shell.`);
+  }
+  return /[\s&|<>^()]/.test(arg) ? `"${arg}"` : arg;
+}
+
 export function electronBuilderInvocation(builderArgs, platform = process.platform) {
+  const args = ['exec', 'electron-builder', '--', ...builderArgs];
   return {
     command: platform === 'win32' ? 'npm.cmd' : 'npm',
-    args: ['exec', 'electron-builder', '--', ...builderArgs],
+    args: platform === 'win32' ? args.map(quoteForCmd) : args,
     shell: platform === 'win32',
   };
 }
@@ -157,13 +194,31 @@ export function electronBuilderInvocation(builderArgs, platform = process.platfo
 // Windows build would try to Authenticode-sign with the Apple Developer ID
 // certificate. Give electron-builder only the target platform's variables.
 export function builderEnvironment(target, env = process.env) {
-  let foreignKeys = [...MAC_KEYS, ...WINDOWS_KEYS];
+  const windowsKeys = [...WINDOWS_KEYS, ...AZURE_SIGNING_KEYS];
+  let foreignKeys = [...MAC_KEYS, ...windowsKeys];
   if (target.startsWith('macos-')) {
-    foreignKeys = WINDOWS_KEYS;
+    foreignKeys = windowsKeys;
   } else if (target === 'windows') {
     foreignKeys = MAC_KEYS;
   }
   return Object.fromEntries(Object.entries(env).filter(([key]) => !foreignKeys.includes(key)));
+}
+
+// What a Windows build must pass before it is published as "signed": Windows
+// itself reports each installer's Authenticode signature as Valid.
+export function windowsSignatureCheck(exePath) {
+  const literal = exePath.replace(/'/g, "''");
+  return [
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      `$s = Get-AuthenticodeSignature -LiteralPath '${literal}'; ` +
+        "Write-Output ('{0}: {1} ({2})' -f $s.Path, $s.Status, $s.SignerCertificate.Subject); " +
+        "if ($s.Status -ne 'Valid') { exit 1 }",
+    ],
+  ];
 }
 
 // electron-builder hands APPLE_API_KEY to notarytool as the *path* of the

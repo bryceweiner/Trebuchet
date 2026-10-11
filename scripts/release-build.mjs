@@ -13,6 +13,7 @@ import {
   electronBuilderInvocation,
   macSignatureChecks,
   resolveReleaseBuild,
+  windowsSignatureCheck,
 } from './release-lib.mjs';
 
 // Apple's Developer ID intermediate (G2). codesign can't build the chain to
@@ -189,6 +190,18 @@ if (plan.trust === 'signed and notarized') {
           `${command} ${args[0]} rejected ${path.relative(projectRoot, appPath)}; refusing to publish it as signed and notarized.`,
         );
       }
+    }
+  }
+}
+
+// Likewise for Windows: electron-builder announces "signing" even when it
+// signs nothing, so only Windows' own verdict on each installer counts.
+if (plan.target === 'windows' && plan.trust === 'signed') {
+  for (const exePath of artifactPaths) {
+    const [command, args] = windowsSignatureCheck(exePath);
+    const check = spawnSync(command, args, { stdio: 'inherit' });
+    if (check.status !== 0) {
+      throw new Error(`${path.basename(exePath)} is not validly signed; refusing to publish it as signed.`);
     }
   }
 }

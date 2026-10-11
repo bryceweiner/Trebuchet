@@ -12,6 +12,7 @@ import {
   macSignatureChecks,
   resolveReleaseBuild,
   staleReleaseAssetNames,
+  windowsSignatureCheck,
 } from '../scripts/release-lib.mjs';
 
 const read = (file) => readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
@@ -226,9 +227,13 @@ test('each platform build sees only its own signing credentials', () => {
     APPLE_API_KEY: 'key',
     WIN_CSC_LINK: 'base64-pfx',
     WIN_CSC_KEY_PASSWORD: 'secret',
+    AZURE_CLIENT_SECRET: 'secret',
+    ARTIFACT_SIGNING_PUBLISHER: 'First Last',
   };
 
   assert.deepEqual(Object.keys(builderEnvironment('windows', env)).sort(), [
+    'ARTIFACT_SIGNING_PUBLISHER',
+    'AZURE_CLIENT_SECRET',
     'PATH',
     'WIN_CSC_KEY_PASSWORD',
     'WIN_CSC_LINK',
@@ -240,6 +245,59 @@ test('each platform build sees only its own signing credentials', () => {
     'PATH',
   ]);
   assert.deepEqual(Object.keys(builderEnvironment('linux', env)), ['PATH']);
+});
+
+test('windows builds sign through Azure Artifact Signing when it is configured', () => {
+  const azure = {
+    AZURE_TENANT_ID: 'tenant',
+    AZURE_CLIENT_ID: 'client',
+    AZURE_CLIENT_SECRET: 'secret',
+    ARTIFACT_SIGNING_ENDPOINT: 'https://eus.codesigning.azure.net',
+    ARTIFACT_SIGNING_ACCOUNT: 'trebuchet',
+    ARTIFACT_SIGNING_PROFILE: 'TrebuchetPublic',
+    ARTIFACT_SIGNING_PUBLISHER: 'First Last',
+  };
+  const plan = resolveReleaseBuild('windows', azure);
+
+  assert.equal(plan.trust, 'signed');
+  assert.deepEqual(plan.builderArgs.slice(4), [
+    '-c.forceCodeSigning=true',
+    '-c.win.azureSignOptions.endpoint=https://eus.codesigning.azure.net',
+    '-c.win.azureSignOptions.codeSigningAccountName=trebuchet',
+    '-c.win.azureSignOptions.certificateProfileName=TrebuchetPublic',
+    '-c.win.azureSignOptions.publisherName=First Last',
+  ]);
+  assert.throws(
+    () => resolveReleaseBuild('windows', { ...azure, AZURE_CLIENT_SECRET: '' }),
+    /Incomplete Windows signing configuration/,
+  );
+
+  // cmd.exe splits the command line on spaces, so the publisher name must
+  // reach electron-builder quoted on Windows (and only there).
+  assert.ok(
+    electronBuilderInvocation(plan.builderArgs, 'win32').args.includes(
+      '"-c.win.azureSignOptions.publisherName=First Last"',
+    ),
+  );
+  assert.ok(
+    electronBuilderInvocation(plan.builderArgs, 'linux').args.includes(
+      '-c.win.azureSignOptions.publisherName=First Last',
+    ),
+  );
+  assert.throws(() => electronBuilderInvocation(['-c.x=%PATH%'], 'win32'), /Windows shell/);
+
+  const workflow = read('.github/workflows/release.yml');
+  assert.match(workflow, /AZURE_CLIENT_SECRET: \$\{\{ secrets\.AZURE_CLIENT_SECRET \}\}/);
+  assert.match(workflow, /ARTIFACT_SIGNING_PUBLISHER: \$\{\{ vars\.ARTIFACT_SIGNING_PUBLISHER \}\}/);
+});
+
+test('signed Windows installers must pass Authenticode verification before publishing', () => {
+  const [command, args] = windowsSignatureCheck("D:\\a\\it's\\Trebuchet-1.2.3-Setup.exe");
+
+  assert.equal(command, 'powershell.exe');
+  assert.ok(args.at(-1).includes("Get-AuthenticodeSignature -LiteralPath 'D:\\a\\it''s\\Trebuchet-1.2.3-Setup.exe'"));
+  assert.ok(args.at(-1).includes("if ($s.Status -ne 'Valid') { exit 1 }"));
+  assert.match(read('scripts/release-build.mjs'), /windowsSignatureCheck\(exePath\)/);
 });
 
 test('notarization key secrets are handed to notarytool as a file', () => {
