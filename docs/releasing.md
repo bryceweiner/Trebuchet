@@ -37,6 +37,22 @@ The workflow builds:
 
 If any desktop artifact is published as an unsigned test artifact, the workflow marks the GitHub Release as a prerelease.
 
+Each platform's build receives only its own signing variables. electron-builder falls back to `CSC_LINK` on Windows when `WIN_CSC_LINK` is unset, so without that filter the Windows build would try to sign with the Apple certificate.
+
+### Setting up macOS signing
+
+1. Join the [Apple Developer Program](https://developer.apple.com/programs/enroll/). The account holder's name is the publisher users see.
+2. Create a **Developer ID Application** certificate. In Keychain Access, choose Certificate Assistant → Request a Certificate From a Certificate Authority and save the request to disk. Upload it under [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/certificates/add), then open the downloaded certificate to add it to your keychain.
+3. In Keychain Access → My Certificates, export "Developer ID Application: …" as a `.p12` protected by a strong password.
+4. For notarization, create an App Store Connect API key under Users and Access → Integrations → Team Keys, with **Developer** access. Download the `.p8` (Apple allows one download), and note its Key ID and the Issuer ID.
+5. Add these repository secrets under Settings → Secrets and variables → Actions:
+   - `CSC_LINK`: the `.p12`, base64-encoded (`base64 -i DeveloperID.p12 | pbcopy`)
+   - `CSC_KEY_PASSWORD`: the `.p12` password
+   - `APPLE_API_KEY`: the full text of the `.p8` (`pbcopy < AuthKey_XXXXXXXXXX.p8`); the build writes it to a file for `notarytool`
+   - `APPLE_API_KEY_ID` and `APPLE_API_ISSUER`
+
+The next release then signs and notarizes both macOS DMGs. The build refuses to label them signed and notarized unless `codesign`, `stapler`, and Gatekeeper (`spctl`) all accept the app.
+
 ## Verification
 
 Every release attaches `SHA256SUMS.txt`.

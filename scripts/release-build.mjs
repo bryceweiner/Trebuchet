@@ -1,8 +1,16 @@
 import { spawnSync } from 'node:child_process';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
-import { collectFiles, electronBuilderInvocation, resolveReleaseBuild } from './release-lib.mjs';
+import {
+  appleApiKeyContents,
+  builderEnvironment,
+  collectFiles,
+  electronBuilderInvocation,
+  macSignatureChecks,
+  resolveReleaseBuild,
+} from './release-lib.mjs';
 
 const target = process.env.TREBUCHET_RELEASE_TARGET;
 
@@ -47,13 +55,30 @@ await rm(distDir, { force: true, recursive: true });
   }
 }
 
+const env = builderEnvironment(plan.target, process.env);
+
+// notarytool reads the App Store Connect key from a file; see
+// appleApiKeyContents. Removed again as soon as electron-builder exits.
+const apiKeyContents = plan.target.startsWith('macos-') ? appleApiKeyContents(env) : null;
+const apiKeyDir = apiKeyContents ? await mkdtemp(path.join(os.tmpdir(), 'trebuchet-notary-')) : null;
+if (apiKeyDir) {
+  env.APPLE_API_KEY = path.join(apiKeyDir, 'AuthKey.p8');
+  await writeFile(env.APPLE_API_KEY, apiKeyContents.endsWith('\n') ? apiKeyContents : `${apiKeyContents}\n`, {
+    mode: 0o600,
+  });
+}
+
 const invocation = electronBuilderInvocation(plan.builderArgs);
 const result = spawnSync(invocation.command, invocation.args, {
   cwd: projectRoot,
-  env: process.env,
+  env,
   shell: invocation.shell,
   stdio: 'inherit',
 });
+
+if (apiKeyDir) {
+  await rm(apiKeyDir, { force: true, recursive: true });
+}
 
 if (result.error) {
   throw result.error;
@@ -71,6 +96,34 @@ const artifactPaths = builtFiles.filter((file) =>
 for (const expected of plan.expectedFiles) {
   if (!artifactPaths.some((file) => expected.matches(path.basename(file)))) {
     throw new Error(`Missing ${expected.description} for ${plan.label}.`);
+  }
+}
+
+// The release notes will say "signed and notarized", so prove it first on
+// the unpacked app electron-builder leaves at dist/mac*/<name>.app.
+if (plan.trust === 'signed and notarized') {
+  const apps = [];
+  for (const entry of await readdir(distDir, { withFileTypes: true })) {
+    if (entry.isDirectory() && entry.name.startsWith('mac')) {
+      for (const inner of await readdir(path.join(distDir, entry.name), { withFileTypes: true })) {
+        if (inner.isDirectory() && inner.name.endsWith('.app')) {
+          apps.push(path.join(distDir, entry.name, inner.name));
+        }
+      }
+    }
+  }
+  if (apps.length === 0) {
+    throw new Error(`No .app found under dist/ to verify for ${plan.label}.`);
+  }
+  for (const appPath of apps) {
+    for (const [command, args] of macSignatureChecks(appPath)) {
+      const check = spawnSync(command, args, { stdio: 'inherit' });
+      if (check.status !== 0) {
+        throw new Error(
+          `${command} ${args[0]} rejected ${path.relative(projectRoot, appPath)}; refusing to publish it as signed and notarized.`,
+        );
+      }
+    }
   }
 }
 

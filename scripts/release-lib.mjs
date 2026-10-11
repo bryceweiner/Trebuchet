@@ -150,6 +150,42 @@ export function electronBuilderInvocation(builderArgs, platform = process.platfo
   };
 }
 
+// Every platform's build job receives every signing secret, and
+// electron-builder falls back to CSC_LINK when WIN_CSC_LINK is unset, so a
+// Windows build would try to Authenticode-sign with the Apple Developer ID
+// certificate. Give electron-builder only the target platform's variables.
+export function builderEnvironment(target, env = process.env) {
+  let foreignKeys = [...MAC_KEYS, ...WINDOWS_KEYS];
+  if (target.startsWith('macos-')) {
+    foreignKeys = WINDOWS_KEYS;
+  } else if (target === 'windows') {
+    foreignKeys = MAC_KEYS;
+  }
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !foreignKeys.includes(key)));
+}
+
+// electron-builder hands APPLE_API_KEY to notarytool as the *path* of the
+// .p8 key, but a GitHub secret can only hold the key's text. Returns that
+// text when the variable carries it, so the caller can write it to a file
+// and repoint APPLE_API_KEY, or null when it is already a path.
+export function appleApiKeyContents(env) {
+  const value = env.APPLE_API_KEY;
+  return typeof value === 'string' && value.includes('-----BEGIN PRIVATE KEY-----') ? value : null;
+}
+
+// What a macOS build must pass before it is published as "signed and
+// notarized": a valid signature, a stapled notarization ticket, and
+// Gatekeeper's approval. electron-builder fails on outright signing or
+// notarization errors; these catch a build that succeeded into something
+// Gatekeeper would still reject.
+export function macSignatureChecks(appPath) {
+  return [
+    ['codesign', ['--verify', '--deep', '--strict', '--verbose=2', appPath]],
+    ['xcrun', ['stapler', 'validate', appPath]],
+    ['spctl', ['--assess', '--type', 'execute', '--verbose=4', appPath]],
+  ];
+}
+
 export async function collectFiles(rootDir) {
   const found = [];
 

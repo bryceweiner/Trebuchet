@@ -4,8 +4,11 @@ import { existsSync, readFileSync } from 'node:fs';
 
 import { nextRelease, releaseTypeFromLabels } from '../scripts/auto-version.mjs';
 import {
+  appleApiKeyContents,
+  builderEnvironment,
   buildReleaseNotes,
   electronBuilderInvocation,
+  macSignatureChecks,
   resolveReleaseBuild,
   staleReleaseAssetNames,
 } from '../scripts/release-lib.mjs';
@@ -210,6 +213,56 @@ test('release builder invokes npm through a shell on Windows', () => {
     args: ['exec', 'electron-builder', '--', '--win'],
     shell: true,
   });
+});
+
+test('each platform build sees only its own signing credentials', () => {
+  // electron-builder falls back to CSC_LINK on Windows when WIN_CSC_LINK is
+  // unset, so the Windows build must never see the Apple certificate.
+  const env = {
+    PATH: '/usr/bin',
+    CSC_LINK: 'base64-p12',
+    CSC_KEY_PASSWORD: 'secret',
+    APPLE_API_KEY: 'key',
+    WIN_CSC_LINK: 'base64-pfx',
+    WIN_CSC_KEY_PASSWORD: 'secret',
+  };
+
+  assert.deepEqual(Object.keys(builderEnvironment('windows', env)).sort(), [
+    'PATH',
+    'WIN_CSC_KEY_PASSWORD',
+    'WIN_CSC_LINK',
+  ]);
+  assert.deepEqual(Object.keys(builderEnvironment('macos-x64', env)).sort(), [
+    'APPLE_API_KEY',
+    'CSC_KEY_PASSWORD',
+    'CSC_LINK',
+    'PATH',
+  ]);
+  assert.deepEqual(Object.keys(builderEnvironment('linux', env)), ['PATH']);
+});
+
+test('notarization key secrets are handed to notarytool as a file', () => {
+  const pem = '-----BEGIN PRIVATE KEY-----\nMIGTAgEA\n-----END PRIVATE KEY-----';
+
+  assert.equal(appleApiKeyContents({ APPLE_API_KEY: pem }), pem);
+  assert.equal(appleApiKeyContents({ APPLE_API_KEY: '/keys/AuthKey_ABC123.p8' }), null);
+  assert.equal(appleApiKeyContents({}), null);
+});
+
+test('signed macOS builds must satisfy Gatekeeper before they are published', () => {
+  const app = 'dist/mac-arm64/Trebuchet.app';
+
+  assert.deepEqual(
+    macSignatureChecks(app).map(([command, args]) => [command, ...args].join(' ')),
+    [
+      `codesign --verify --deep --strict --verbose=2 ${app}`,
+      `xcrun stapler validate ${app}`,
+      `spctl --assess --type execute --verbose=4 ${app}`,
+    ],
+  );
+  const build = read('scripts/release-build.mjs');
+  assert.match(build, /builderEnvironment\(plan\.target/);
+  assert.match(build, /macSignatureChecks\(appPath\)/);
 });
 
 test('release notes call out prerelease trust gaps and checksum verification', () => {
