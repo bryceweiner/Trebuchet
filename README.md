@@ -130,7 +130,9 @@ life — and the next steps for listings laid out.
 Tagged GitHub releases are built from a clean checkout in GitHub Actions.
 Each release includes `SHA256SUMS.txt`, and the release notes state which
 desktop artifacts were signed, notarized, unsigned, or published as
-unsigned test artifacts. Merges to `main` automatically create the next
+unsigned test artifacts. Releases the maintainer has signed also include
+`SHA256SUMS.txt.sig`, and their notes show how to verify it with
+`ssh-keygen`. Merges to `main` automatically create the next
 release and publish the GitHub Package. See [docs/releasing.md](docs/releasing.md).
 
 ---

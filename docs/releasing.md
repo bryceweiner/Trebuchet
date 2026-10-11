@@ -2,7 +2,7 @@
 
 Merges to `main` are versioned by [`.github/workflows/auto-release.yml`](../.github/workflows/auto-release.yml), which computes and pushes the next `v*` tag.
 Tagged releases are then built by [`.github/workflows/release.yml`](../.github/workflows/release.yml) from a clean checkout using `npm ci`.
-After the desktop artifacts are published to GitHub Releases, the same workflow publishes the npm package to GitHub Packages and uploads the static [`website/`](../website) directory to the production site.
+After the desktop artifacts are published to GitHub Releases, the same workflow publishes the npm package to GitHub Packages and uploads the static [`website/`](../website) directory to the production site. Those two jobs run only on `AnOversizedMooseWithSocks/Trebuchet`: they publish into the upstream npm scope and FTP site, so forks skip them.
 
 ## Trigger
 
@@ -49,9 +49,38 @@ shasum -a 256 -c SHA256SUMS.txt
 
 The release notes also state which platform artifacts were signed, notarized, unsigned, or unsigned test artifacts.
 
+Releases the maintainer has signed also attach `SHA256SUMS.txt.sig`, an SSH signature over `SHA256SUMS.txt` by the key in [`allowed_signers`](allowed_signers). Their release notes end with a **Maintainer signature** section giving the exact commands; from a checkout of this repository:
+
+```bash
+ssh-keygen -Y verify -f docs/allowed_signers -I bryceweiner@users.noreply.github.com -n file -s SHA256SUMS.txt.sig < SHA256SUMS.txt
+shasum -a 256 -c --ignore-missing SHA256SUMS.txt
+```
+
+A valid signature prints `Good "file" signature for ...`. It shows the checksums came from the maintainer; it is not macOS or Windows code signing, so the operating-system warnings described above still apply.
+
+## Signing a release
+
+Signing runs on the maintainer's Mac after the Release workflow has published, because the key lives in the Secure Enclave via [Secretive](https://github.com/maxgoedjen/secretive) and never reaches CI.
+
+One-time setup:
+
+1. In Secretive, create a secret named `Trebuchet release signing` with **Require Authentication** turned on.
+2. Add its public key to [`allowed_signers`](allowed_signers) as `<git email> namespaces="file" <public key>`, and commit it.
+
+For each release:
+
+```bash
+node scripts/sign-release.mjs v1.2.3            # check, sign, attach, add the notes section
+node scripts/sign-release.mjs v1.2.3 --dry-run  # check and sign only
+```
+
+The script refuses to sign unless `SHA256SUMS.txt` matches the SHA-256 GitHub reports for every attached file, and it uploads only a signature that verifies against `docs/allowed_signers`. It authenticates with `GH_TOKEN` or `GITHUB_TOKEN`, falling back to the credential git uses for github.com.
+
+Rerunning the Release workflow for a tag deletes `SHA256SUMS.txt.sig` along with the other stale assets, since the rebuilt checksums no longer match it, so sign that release again afterwards. When replacing the key, keep the old entry in `allowed_signers` so earlier releases still verify.
+
 ## GitHub Packages
 
-Each tagged release publishes `@anoversizedmoosewithsocks/trebuchet-desktop` to GitHub Packages with the same version as the Git tag. If the package version already exists during a rerun, the package publish step exits successfully because npm package versions are immutable.
+Each tagged release publishes `@anoversizedmoosewithsocks/trebuchet-desktop` to GitHub Packages with the same version as the Git tag. If the package version already exists during a rerun, the package publish step exits successfully because npm package versions are immutable. Only the upstream repository runs this job.
 
 ## Repeatability
 
@@ -59,7 +88,7 @@ The workflow updates an existing release for the same tag by re-uploading curren
 
 ## Website publishing
 
-The release workflow publishes [`website/`](../website) over FTP after the GitHub Release is created.
+The release workflow publishes [`website/`](../website) over FTP after the GitHub Release is created. Only the upstream repository runs this job.
 
 Required secrets:
 

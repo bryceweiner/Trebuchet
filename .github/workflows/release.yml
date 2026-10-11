@@ -238,6 +238,12 @@ jobs:
   package:
     name: Publish GitHub Package
     needs: publish
+    # Upstream-only. This publishes into the upstream owner's npm scope
+    # (@anoversizedmoosewithsocks), which a fork's GITHUB_TOKEN can't
+    # write to — so on forks it always failed, after the GitHub Release
+    # was already out, and turned every fork release run red. The website
+    # job below is guarded the same way (upstream's FTP host and secrets).
+    if: github.repository == 'AnOversizedMooseWithSocks/Trebuchet'
     runs-on: ubuntu-latest
 
     steps:
@@ -280,6 +286,8 @@ jobs:
   website:
     name: Publish Website
     needs: publish
+    # Upstream-only: see the package job above.
+    if: github.repository == 'AnOversizedMooseWithSocks/Trebuchet'
     runs-on: ubuntu-latest
     env:
       FTP_HOST: ${{ vars.FTP_HOST != '' && vars.FTP_HOST || 'p1401.use1.mysecurecloudhost.com' }}

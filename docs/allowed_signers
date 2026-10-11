@@ -1,0 +1,3 @@
+# OpenSSH allowed_signers file: the key that signs SHA256SUMS.txt for
+# Trebuchet releases. See "Verification" in docs/releasing.md.
+bryceweiner@users.noreply.github.com namespaces="file" ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOvr4UMDIECu7YV20FrYbUhvjGcSUCXAKbZKD0vMJDU9FMRvkvpmVhUPtgJ3fTewz5T6HtcqwxvqSp+TwF15V5o=

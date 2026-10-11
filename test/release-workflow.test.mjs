@@ -96,6 +96,27 @@ test('release workflow publishes the GitHub package for each tag', () => {
   assert.match(workflow, /npm publish/);
 });
 
+test('upstream-only publish jobs are skipped on forks', () => {
+  // The npm package lives in the upstream owner's scope and the website
+  // FTPs to upstream's host, so on a fork both jobs can only fail — after
+  // the release is already out — turning every fork release run red. The
+  // release itself must still build and publish everywhere.
+  const workflow = read('.github/workflows/release.yml');
+  const guard = /^ {4}if: github\.repository == 'AnOversizedMooseWithSocks\/Trebuchet'$/m;
+  const job = (id) => {
+    const start = workflow.indexOf(`\n  ${id}:\n`);
+    assert.notEqual(start, -1, `release.yml has no ${id} job`);
+    const end = workflow.slice(start + 1).search(/\n {2}[\w-]+:\n/);
+    return end === -1 ? workflow.slice(start) : workflow.slice(start, start + 1 + end);
+  };
+
+  assert.match(job('package'), guard);
+  assert.match(job('website'), guard);
+  for (const id of ['test', 'build', 'ui-capture', 'publish']) {
+    assert.doesNotMatch(job(id), guard, `${id} must run on forks too`);
+  }
+});
+
 test('release docs explain trust states and verification', () => {
   const docs = read('docs/releasing.md');
 
@@ -107,6 +128,8 @@ test('release docs explain trust states and verification', () => {
   assert.match(docs, /GitHub Packages/);
   assert.match(docs, /WIN_CSC_LINK/);
   assert.match(docs, /APPLE_API_KEY/);
+  assert.match(docs, /SHA256SUMS\.txt\.sig/);
+  assert.match(docs, /scripts\/sign-release\.mjs/);
   assert.match(docs, /SHA256SUMS\.txt/);
 });
 
